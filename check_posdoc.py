@@ -1,11 +1,15 @@
 """
-Revisa la página de SECIHTI buscando la convocatoria de posdoctorado 2026.
-Si la encuentra (y antes no estaba), envía un correo de aviso.
-Guarda el estado en state.json para no enviar el mismo aviso varias veces.
+Revisa la página específica de SECIHTI de "Estancias Posdoctorales por México"
+y avisa por correo cuando el contenido relevante cambie (por ejemplo: cuando
+aparezca un nuevo registro 2026, o desaparezca el aviso de "próximamente").
+
+Guarda un hash del contenido en state.json para detectar cambios entre corridas.
 """
 
+import hashlib
 import json
 import os
+import re
 import smtplib
 import sys
 from email.mime.text import MIMEText
@@ -13,17 +17,16 @@ from email.mime.text import MIMEText
 import requests
 from bs4 import BeautifulSoup
 
-URL = "https://www.secihti.mx/periodo-convocatoria/2026/"
+URL = (
+    "https://www.secihti.mx/convocatoria_categoria/becas-nacionales/"
+    "becas-de-consolidacion/estancias-posdoctorales-por-mexico/"
+)
 STATE_FILE = "state.json"
 
-KEYWORDS = [
-    "posdoc",
-    "posdoctoral",
-    "pos-doctoral",
-    "postdoctoral",
-    "estancias posdoctorales",
-    "estancia posdoctoral",
-]
+# Marcadores de texto que delimitan la sección relevante de la página
+# (excluye menú de navegación y pie de página, que no cambian por esto).
+START_MARKER = "Categoría (Convocatorias)"
+END_MARKER = "Ubicación"
 
 
 def fetch_page(url: str) -> str:
@@ -39,29 +42,35 @@ def fetch_page(url: str) -> str:
     return resp.text
 
 
-def find_matches(html: str):
+def extract_relevant_section(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(separator=" ").lower()
 
-    found_keywords = [kw for kw in KEYWORDS if kw in text]
+    # Quita elementos que no aportan señal (scripts, estilos).
+    for tag in soup(["script", "style"]):
+        tag.decompose()
 
-    matching_links = []
-    for a in soup.find_all("a"):
-        link_text = (a.get_text() or "").lower()
-        href = a.get("href") or ""
-        if any(kw in link_text or kw in href.lower() for kw in KEYWORDS):
-            matching_links.append(
-                {"text": a.get_text(strip=True), "href": href}
-            )
+    full_text = soup.get_text(separator="\n")
 
-    return found_keywords, matching_links
+    start = full_text.find(START_MARKER)
+    end = full_text.find(END_MARKER, start if start != -1 else 0)
+
+    if start != -1 and end != -1:
+        section = full_text[start:end]
+    else:
+        # Si los marcadores cambiaron de texto, usa la página completa
+        # como respaldo (más propenso a falsos positivos, pero no falla).
+        section = full_text
+
+    # Normaliza espacios en blanco para que el hash sea estable.
+    section = re.sub(r"\s+", " ", section).strip()
+    return section
 
 
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"found": False}
+    return {}
 
 
 def save_state(state: dict) -> None:
@@ -91,33 +100,35 @@ def main():
         print(f"Error al descargar la página: {exc}")
         sys.exit(1)
 
-    found_keywords, matching_links = find_matches(html)
-    found = bool(found_keywords)
+    section = extract_relevant_section(html)
+    current_hash = hashlib.sha256(section.encode("utf-8")).hexdigest()
 
     state = load_state()
-    was_found = state.get("found", False)
+    previous_hash = state.get("hash")
 
-    print(f"Encontrado ahora: {found} | Antes: {was_found}")
-    print(f"Palabras clave detectadas: {found_keywords}")
+    print(f"Hash actual: {current_hash}")
+    print(f"Hash anterior: {previous_hash}")
 
-    if found and not was_found:
-        links_text = "\n".join(
-            f"- {link['text']} -> {link['href']}" for link in matching_links
-        ) or "(no se encontraron enlaces específicos, revisa la página manualmente)"
+    is_first_run = previous_hash is None
+    changed = (not is_first_run) and (current_hash != previous_hash)
 
+    if changed:
+        snippet = section[:2500]
         body = (
-            "Se detectaron menciones de 'posdoc' en la página de convocatorias "
-            f"de SECIHTI 2026:\n\n{URL}\n\n"
-            f"Palabras clave encontradas: {', '.join(found_keywords)}\n\n"
-            f"Enlaces relacionados:\n{links_text}\n\n"
-            "Revisa la página para confirmar los detalles de la convocatoria."
+            "Se detectó un cambio en la página de 'Estancias Posdoctorales "
+            f"por México' de SECIHTI:\n\n{URL}\n\n"
+            "Contenido actual de la sección relevante (puede estar recortado):\n\n"
+            f"{snippet}\n\n"
+            "Revisa la página para confirmar si ya se publicó la convocatoria."
         )
-        send_email("Convocatoria de posdoc SECIHTI detectada", body)
-        print("Correo enviado.")
+        send_email("Cambio detectado: Estancias Posdoctorales SECIHTI", body)
+        print("Correo enviado: se detectó un cambio.")
+    elif is_first_run:
+        print("Primera corrida: se guarda el estado base, sin enviar correo.")
     else:
         print("Sin cambios, no se envía correo.")
 
-    state["found"] = found
+    state["hash"] = current_hash
     save_state(state)
 
 
